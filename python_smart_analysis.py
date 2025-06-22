@@ -200,51 +200,51 @@ Return only valid JSON in this exact format:
 
 def ai_generate_sql_query(question: str, df: pd.DataFrame, schema: List[str]) -> str:
     """
-    Use OpenAI to generate contextually appropriate SQL queries
+    Use OpenAI to generate ONLY valid SQL queries
     """
     try:
         sample_data = df.head(2).to_dict('records') if len(df) > 0 else []
         
-        prompt = f"""You are a business intelligence SQL expert. Generate a precise SQL query for this question:
+        prompt = f"""Generate ONLY a valid SQL query for this question. Do not include any explanations or text.
 
 Question: "{question}"
 Table name: data
 Available columns: {list(df.columns)}
-Data types: {dict(df.dtypes.astype(str))}
 Sample data: {sample_data}
 
-Rules:
-1. Table name is always 'data'
-2. Use proper aggregations (SUM, AVG, COUNT, MAX, MIN)
-3. For "above X" or "more than X" use WHERE column > threshold
-4. For status filtering use WHERE status = 'active' or similar
-5. For "how many" questions use COUNT(*)
-6. For "total" questions use SUM()
-7. For "average" questions use AVG()
-8. For "which/best/highest" use GROUP BY with ORDER BY
-9. Use proper column names exactly as provided
-10. Return only the SQL query, no explanations or markdown
+CRITICAL RULES:
+1. Return ONLY the SQL query, nothing else
+2. Table name is always 'data'
+3. For averages: SELECT AVG(column_name) FROM data WHERE condition
+4. For filtering by year: WHERE year_built < 1980 or WHERE year_built > 1990
+5. Do not include any explanatory text
+6. Do not say "The question is unclear"
+7. If unclear, make a reasonable assumption and write SQL
 
-SQL Query:"""
+SQL Query (no explanations):"""
 
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=150
+            max_tokens=100  # Limit tokens to force concise SQL
         )
         
         sql_query = response.choices[0].message.content.strip()
         
-        # Clean up the response (remove any markdown or extra text)
+        # Clean up response - remove any non-SQL text
         sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+        
+        # Validate it starts with SQL keywords
+        if not any(sql_query.upper().startswith(keyword) for keyword in ['SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE']):
+            logger.warning(f"Generated non-SQL response: {sql_query}")
+            return "SELECT COUNT(*) FROM data"  # Safe fallback
         
         return sql_query
         
     except Exception as e:
         logger.error(f"Error in AI SQL generation: {str(e)}")
-        # Fallback to basic SQL
-        return "SELECT * FROM data LIMIT 10"
+        return "SELECT COUNT(*) FROM data"  # Safe fallback
 
 def ai_format_answer(question: str, sql_results: List[pd.DataFrame], business_intent: str) -> str:
     """
