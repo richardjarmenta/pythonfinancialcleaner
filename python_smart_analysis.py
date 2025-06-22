@@ -44,26 +44,34 @@ app.add_middleware(
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Pydantic models for request and response validation
-class AnalysisRequest(BaseModel):
-    """Request model for the smart analysis endpoint"""
+class FlexibleAnalysisRequest(BaseModel):
+    """More flexible request model that handles various input formats"""
     question: str = Field(..., description="Natural language business question")
-    rows: List[Dict[str, Any]] = Field(..., description="List of data rows from Supabase")
-    file_title: Optional[str] = Field(None, description="Optional metadata about the data source")
-    schema: Optional[List[str]] = Field(None, description="Optional column headers for reference")
+    rows: Union[List[Dict[str, Any]], str] = Field(..., description="Data rows as list or JSON string")
+    file_title: Optional[str] = Field(None, description="Optional file title")
+    schema: Union[List[str], str] = Field(None, description="Schema as list or string")
     
-    @field_validator('question')
-    @classmethod
-    def question_must_not_be_empty(cls, v):
-        if not v or not v.strip():
-            raise ValueError('Question cannot be empty')
-        return v.strip()
-    
-    @field_validator('rows')
-    @classmethod
-    def rows_must_not_be_empty(cls, v):
-        if not v:
-            raise ValueError('Rows cannot be empty')
+    @validator('rows', pre=True)
+    def parse_rows(cls, v):
+        """Handle rows as string or list"""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                raise ValueError("Invalid JSON string for rows")
         return v
+    
+    @validator('schema', pre=True)
+    def parse_schema(cls, v):
+        """Handle schema as string or list"""
+        if isinstance(v, str):
+            try:
+                # Try parsing as JSON first
+                return json.loads(v)
+            except json.JSONDecodeError:
+                # If not JSON, split by comma
+                return [s.strip() for s in v.split(',')]
+        return v or []
 
 class AnalysisResponse(BaseModel):
     """Response model for the smart analysis endpoint"""
@@ -503,35 +511,53 @@ def analyze_data_file(
 # ================================
 
 @app.post("/smart-analysis", response_model=AnalysisResponse)
-async def analyze_data(request: AnalysisRequest) -> AnalysisResponse:
+async def analyze_data_flexible(request: Union[FlexibleAnalysisRequest, dict]) -> AnalysisResponse:
     """
-    Main endpoint for analyzing business data with natural language questions
+    More flexible endpoint with better error handling
     """
     try:
-        logger.info(f"Received analysis request: {request.question}")
-        logger.info(f"Data rows: {len(request.rows)}")
+        # Handle raw dict input
+        if isinstance(request, dict):
+            try:
+                request = FlexibleAnalysisRequest(**request)
+            except Exception as e:
+                logger.error(f"Validation error: {str(e)}")
+                # Return a helpful error response instead of 422
+                return AnalysisResponse(
+                    answer=f"Data format error: {str(e)}",
+                    explanation="Unable to parse input data format",
+                    confidence_score=0.0,
+                    analysis_type="error",
+                    raw_insights=["Input validation failed"],
+                    metadata={"error": str(e)}
+                )
         
-        # Perform the analysis using AI-enhanced approach
-        result = analyze_data_file(
-            rows=request.rows,
+        logger.info(f"Received analysis request: {request.question}")
+        logger.info(f"Data rows: {len(request.rows) if isinstance(request.rows, list) else 'Invalid format'}")
+        
+        # Perform analysis
+        result = analyze_flexible_data(
             question=request.question,
+            data=request.rows,
             file_title=request.file_title,
             schema=request.schema
         )
         
-        # Convert to Pydantic response model
         response = AnalysisResponse(**result)
-        
         logger.info(f"Analysis completed: {response.analysis_type}")
         return response
         
     except Exception as e:
-        logger.error(f"Error in analyze endpoint: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {str(e)}"
+        logger.error(f"Error in analysis endpoint: {str(e)}")
+        # Return error response instead of raising HTTP exception
+        return AnalysisResponse(
+            answer=f"Analysis failed: {str(e)}",
+            explanation="An error occurred during analysis",
+            confidence_score=0.0,
+            analysis_type="error",
+            raw_insights=["Analysis error"],
+            metadata={"error": str(e)}
         )
-
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
