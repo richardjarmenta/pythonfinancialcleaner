@@ -3,4 +3,3 @@ uvicorn[standard]
 openai
 pandas>=2.2.0
 numpy
-python-version==3.11.9
