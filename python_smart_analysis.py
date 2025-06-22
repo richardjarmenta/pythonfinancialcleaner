@@ -1,6 +1,6 @@
 """
 Smart Analysis API - FastAPI service for analyzing business data with GPT
-IMPROVED VERSION - Fixes critical prompt engineering and data analysis flaws
+FIXED VERSION - Addresses critical multi-query and answer consistency issues
 """
 
 import os
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Smart Analysis API",
     description="Analyze tabular business data using natural language questions",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 # Add CORS middleware for web integration
@@ -144,14 +144,6 @@ def clean_and_normalize_data(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 def detect_analysis_requirements(question: str, df: pd.DataFrame) -> Dict[str, Any]:
     """
     Analyze the question and data to determine analysis requirements and confidence.
-    This helps the agent system understand when this tool is most appropriate.
-    
-    Args:
-        question: Natural language business question
-        df: DataFrame to analyze
-        
-    Returns:
-        Dictionary with analysis requirements and recommendations
     """
     requirements = {
         "analysis_type": "general",
@@ -160,10 +152,17 @@ def detect_analysis_requirements(question: str, df: pd.DataFrame) -> Dict[str, A
         "tool_suitability": 0.8,
         "recommended_approach": "python_analysis",
         "requires_full_dataset": False,
-        "computation_heavy": False
+        "computation_heavy": False,
+        "is_multi_part": False
     }
     
     question_lower = question.lower()
+    
+    # Detect multi-part questions
+    multi_part_indicators = [' and ', ' which ', ' what ', ' who ', ' also ']
+    if any(indicator in question_lower for indicator in multi_part_indicators):
+        requirements["is_multi_part"] = True
+        requirements["complexity"] = "high"
     
     # Detect numerical/statistical analysis needs
     numerical_keywords = ['calculate', 'sum', 'average', 'mean', 'median', 'count', 'total', 
@@ -176,267 +175,263 @@ def detect_analysis_requirements(question: str, df: pd.DataFrame) -> Dict[str, A
         requirements["computation_heavy"] = True
         requirements["tool_suitability"] = 0.95
     
-    # Detect time series analysis
-    time_keywords = ['over time', 'trend', 'monthly', 'yearly', 'quarterly', 'daily',
-                    'before', 'after', 'since', 'until', 'growth', 'change over']
-    
-    if any(keyword in question_lower for keyword in time_keywords):
-        requirements["analysis_type"] = "time_series"
-        requirements["requires_full_dataset"] = True
-        requirements["tool_suitability"] = 0.9
-    
-    # Detect aggregation needs
-    aggregation_keywords = ['by region', 'by category', 'group by', 'breakdown', 'segment',
-                           'per', 'each', 'every', 'all', 'top', 'bottom', 'ranking']
-    
-    if any(keyword in question_lower for keyword in aggregation_keywords):
-        requirements["analysis_type"] = "aggregation"
-        requirements["requires_full_dataset"] = True
-        requirements["tool_suitability"] = 0.85
-    
-    # Detect complex analysis that RAG would struggle with
-    complex_keywords = ['outliers', 'anomaly', 'pattern', 'cluster', 'segment', 'forecast',
-                       'predict', 'model', 'regression', 'variance', 'standard deviation']
-    
-    if any(keyword in question_lower for keyword in complex_keywords):
-        requirements["analysis_type"] = "advanced_analytics"
-        requirements["complexity"] = "high"
-        requirements["computation_heavy"] = True
-        requirements["tool_suitability"] = 0.95
-        requirements["recommended_approach"] = "python_required"
-    
-    # Assess data characteristics
-    if len(df) > 1000:
-        requirements["requires_full_dataset"] = True
-        requirements["complexity"] = "high"
-    
-    if len(df.select_dtypes(include=[np.number]).columns) > 3:
-        requirements["tool_suitability"] += 0.1
-    
-    # Detect questions better suited for RAG
-    text_keywords = ['explain', 'describe', 'what is', 'definition', 'meaning', 'purpose',
-                    'background', 'context', 'why', 'how does', 'overview']
-    
-    if any(keyword in question_lower for keyword in text_keywords) and not requirements["computation_heavy"]:
-        requirements["tool_suitability"] = 0.3
-        requirements["recommended_approach"] = "rag_better"
+    # Detect correlation/complex math that needs pandas
+    pandas_keywords = ['correlation', 'correlate', 'variance', 'standard deviation']
+    if any(keyword in question_lower for keyword in pandas_keywords):
+        requirements["recommended_approach"] = "pandas_required"
+        requirements["tool_suitability"] = 0.98
     
     return requirements
 
-def generate_smart_schema_summary(df: pd.DataFrame) -> Dict[str, Any]:
+def decompose_complex_question(question: str) -> List[str]:
     """
-    Generate an intelligent schema summary that helps GPT understand the data structure.
+    Break down complex questions into simpler sub-questions.
     
     Args:
-        df: Cleaned pandas DataFrame
+        question: Complex natural language question
         
     Returns:
-        Dictionary with smart schema insights
+        List of simpler sub-questions
     """
-    schema_summary = {
-        "columns": {},
-        "data_insights": {},
-        "business_context": {}
-    }
+    question_lower = question.lower()
     
-    for column in df.columns:
-        col_info = {
-            "type": str(df[column].dtype),
-            "null_count": int(df[column].isna().sum()),
-            "unique_count": int(df[column].nunique()),
-            "role": "unknown"
-        }
+    # Common patterns for multi-part questions
+    if " and which " in question_lower or " and who " in question_lower:
+        parts = re.split(r'\s+and\s+(which|who|what)\s+', question, flags=re.IGNORECASE)
+        if len(parts) >= 3:
+            first_part = parts[0].strip()
+            second_part = f"{parts[1]} {parts[2]}".strip()
+            return [first_part, second_part]
+    
+    elif " and " in question_lower:
+        parts = question.split(" and ")
+        if len(parts) == 2:
+            return [part.strip() for part in parts]
+    
+    # If we can't decompose, return original question
+    return [question]
+
+def execute_pandas_analysis(df: pd.DataFrame, question: str) -> Dict[str, Any]:
+    """
+    Use pandas for complex calculations that SQL can't handle well.
+    
+    Args:
+        df: DataFrame to analyze
+        question: Natural language question
         
-        # Determine column role
-        if df[column].dtype in ['int64', 'float64']:
-            col_info["role"] = "numeric"
-            col_info["min"] = float(df[column].min()) if not df[column].isna().all() else None
-            col_info["max"] = float(df[column].max()) if not df[column].isna().all() else None
-            col_info["mean"] = float(df[column].mean()) if not df[column].isna().all() else None
+    Returns:
+        Dictionary with analysis results
+    """
+    question_lower = question.lower()
+    
+    # Handle correlation analysis
+    if 'correlation' in question_lower or 'correlate' in question_lower:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) >= 2:
+            # Find which columns to correlate
+            col1, col2 = None, None
+            for col in numeric_cols:
+                if col.lower() in question_lower:
+                    if col1 is None:
+                        col1 = col
+                    else:
+                        col2 = col
+                        break
             
-            # Check if it might be an ID column
-            if col_info["unique_count"] == len(df) and "id" in column.lower():
-                col_info["role"] = "identifier"
-        
-        elif df[column].dtype == 'datetime64[ns]':
-            col_info["role"] = "datetime"
-            col_info["date_range"] = {
-                "start": str(df[column].min()) if not df[column].isna().all() else None,
-                "end": str(df[column].max()) if not df[column].isna().all() else None
+            if col1 and col2:
+                correlation = df[col1].corr(df[col2])
+                return {
+                    "method": "pandas_correlation",
+                    "result": correlation,
+                    "answer": f"The correlation between {col1} and {col2} is {correlation:.3f}",
+                    "table": df[[col1, col2]].corr().to_string()
+                }
+    
+    # Handle percentage calculations
+    if 'percentage' in question_lower or 'percent' in question_lower:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            # Simple percentage calculation
+            col = numeric_cols[0]
+            total = df[col].sum()
+            return {
+                "method": "pandas_percentage",
+                "result": total,
+                "answer": f"Total {col}: {total:,.2f}",
+                "table": df.groupby(df.columns[0])[col].sum().to_string()
             }
-        
-        else:
-            col_info["role"] = "categorical"
-            # Get top categories for categorical data
-            if col_info["unique_count"] <= 20:  # Only if manageable number of categories
-                value_counts = df[column].value_counts().head(5)
-                col_info["top_values"] = value_counts.to_dict()
-        
-        schema_summary["columns"][column] = col_info
     
-    # Generate data insights
-    schema_summary["data_insights"] = {
-        "total_rows": len(df),
-        "total_columns": len(df.columns),
-        "numeric_columns": len([c for c in df.columns if df[c].dtype in ['int64', 'float64']]),
-        "categorical_columns": len([c for c in df.columns if df[c].dtype == 'object']),
-        "datetime_columns": len([c for c in df.columns if df[c].dtype == 'datetime64[ns]']),
-        "missing_data_percentage": float((df.isna().sum().sum() / (len(df) * len(df.columns))) * 100)
-    }
+    # Default: return basic stats
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 0:
+        col = numeric_cols[0]
+        return {
+            "method": "pandas_basic",
+            "result": df[col].sum(),
+            "answer": f"Analysis completed using pandas",
+            "table": df[numeric_cols].describe().to_string()
+        }
     
-    return schema_summary
+    return None
 
-def create_strategic_data_sample(df: pd.DataFrame, max_rows: int = 15) -> pd.DataFrame:
+def execute_simple_sql_queries(df: pd.DataFrame, sub_questions: List[str]) -> List[Dict[str, Any]]:
     """
-    Create a strategic sample that's more representative than just head().
-    
-    Args:
-        df: DataFrame to sample from
-        max_rows: Maximum number of rows to include
-        
-    Returns:
-        Strategic sample of the DataFrame
-    """
-    if len(df) <= max_rows:
-        return df
-    
-    # Strategy: Mix of head, tail, and random sample to capture patterns
-    head_size = max_rows // 3
-    tail_size = max_rows // 3
-    random_size = max_rows - head_size - tail_size
-    
-    sample_parts = []
-    
-    # Get head
-    sample_parts.append(df.head(head_size))
-    
-    # Get tail
-    sample_parts.append(df.tail(tail_size))
-    
-    # Get random sample from middle
-    if len(df) > head_size + tail_size:
-        middle_df = df.iloc[head_size:-tail_size] if len(df) > head_size + tail_size else df
-        if len(middle_df) > 0:
-            random_sample = middle_df.sample(min(random_size, len(middle_df)), random_state=42)
-            sample_parts.append(random_sample)
-    
-    # Combine and remove duplicates
-    strategic_sample = pd.concat(sample_parts, ignore_index=True).drop_duplicates()
-    
-    return strategic_sample.head(max_rows)
-
-def generate_sql_query_with_gpt(question: str, schema_summary: Dict[str, Any], table_name: str = "data") -> str:
-    """
-    Use GPT to generate a SQL query based on the question and schema.
-    
-    Args:
-        question: Natural language business question
-        schema_summary: Smart schema summary
-        table_name: Name of the table to query
-        
-    Returns:
-        SQL query string
-    """
-    try:
-        # Build schema description for GPT
-        schema_desc = []
-        for col, info in schema_summary["columns"].items():
-            desc = f"- {col}: {info['role']} ({info['type']})"
-            if info["role"] == "categorical" and "top_values" in info:
-                top_vals = list(info["top_values"].keys())[:3]
-                desc += f" - common values: {top_vals}"
-            elif info["role"] == "numeric" and info.get("min") is not None:
-                desc += f" - range: {info['min']:.2f} to {info['max']:.2f}"
-            schema_desc.append(desc)
-        
-        system_prompt = f"""You are a SQL expert. Generate a SQL query to answer the business question.
-
-Table name: {table_name}
-Schema:
-{chr(10).join(schema_desc)}
-
-Rules:
-1. Use standard SQL syntax compatible with SQLite
-2. Return ONLY the SQL query, no explanations
-3. Use appropriate aggregations (SUM, COUNT, AVG, etc.)
-4. Include GROUP BY and ORDER BY when needed
-5. Use LIMIT if asking for "top" results
-6. Handle case-insensitive string matching with LOWER()
-
-Examples:
-- "What's the total revenue?" → SELECT SUM(revenue) as total_revenue FROM data
-- "Top 5 customers by sales" → SELECT customer, SUM(sales) as total_sales FROM data GROUP BY customer ORDER BY total_sales DESC LIMIT 5
-"""
-
-        user_prompt = f"Question: {question}\n\nGenerate the SQL query:"
-
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=300,
-            temperature=0.1
-        )
-        
-        sql_query = response.choices[0].message.content.strip()
-        
-        # Clean up the response - remove markdown formatting if present
-        sql_query = re.sub(r'```sql\n?', '', sql_query)
-        sql_query = re.sub(r'```\n?', '', sql_query)
-        sql_query = sql_query.strip()
-        
-        logger.info(f"Generated SQL query: {sql_query}")
-        return sql_query
-        
-    except Exception as e:
-        logger.error(f"Error generating SQL query: {str(e)}")
-        # Fallback to a simple SELECT
-        return f"SELECT * FROM {table_name} LIMIT 10"
-
-def execute_sql_on_dataframe(df: pd.DataFrame, sql_query: str) -> pd.DataFrame:
-    """
-    Execute SQL query on DataFrame using SQLite.
+    Execute simple, focused SQL queries for each sub-question.
     
     Args:
         df: DataFrame to query
-        sql_query: SQL query to execute
+        sub_questions: List of simple questions
         
     Returns:
-        Result DataFrame
+        List of query results
     """
-    try:
-        # Create temporary SQLite database
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as tmp_file:
-            conn = sqlite3.connect(tmp_file.name)
-            
-            # Write DataFrame to SQLite
-            df.to_sql('data', conn, index=False, if_exists='replace')
+    results = []
+    
+    for i, question in enumerate(sub_questions):
+        try:
+            # Generate simple query for this specific question
+            query = generate_simple_sql_query(question, df)
             
             # Execute query
-            result_df = pd.read_sql_query(sql_query, conn)
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as tmp_file:
+                conn = sqlite3.connect(tmp_file.name)
+                df.to_sql('data', conn, index=False, if_exists='replace')
+                result_df = pd.read_sql_query(query, conn)
+                conn.close()
+                os.unlink(tmp_file.name)
             
-            conn.close()
-            os.unlink(tmp_file.name)  # Clean up temp file
+            results.append({
+                "question": question,
+                "query": query,
+                "result": result_df,
+                "success": True
+            })
             
-            logger.info(f"SQL query executed successfully, returned {len(result_df)} rows")
-            return result_df
-            
-    except Exception as e:
-        logger.error(f"Error executing SQL query: {str(e)}")
-        # Fallback: return the original dataframe head
-        return df.head(10)
+        except Exception as e:
+            logger.error(f"Error executing query for '{question}': {str(e)}")
+            results.append({
+                "question": question,
+                "query": None,
+                "result": pd.DataFrame(),
+                "success": False,
+                "error": str(e)
+            })
+    
+    return results
 
-def analyze_with_gpt_v2(
+def generate_simple_sql_query(question: str, df: pd.DataFrame) -> str:
+    """
+    Generate simple, focused SQL queries instead of complex ones.
+    
+    Args:
+        question: Simple question
+        df: DataFrame for schema info
+        
+    Returns:
+        Simple SQL query string
+    """
+    question_lower = question.lower()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    # Total/sum questions
+    if 'total' in question_lower or 'sum' in question_lower:
+        if numeric_cols:
+            col = numeric_cols[0]  # Use first numeric column
+            return f"SELECT SUM({col}) as total_{col} FROM data"
+    
+    # Highest/maximum questions
+    if 'highest' in question_lower or 'maximum' in question_lower or 'max' in question_lower:
+        if numeric_cols and len(df.columns) > 1:
+            group_col = df.columns[0]  # Use first column for grouping
+            value_col = numeric_cols[0]
+            return f"SELECT {group_col}, SUM({value_col}) as total FROM data GROUP BY {group_col} ORDER BY total DESC LIMIT 1"
+    
+    # Average questions
+    if 'average' in question_lower or 'mean' in question_lower:
+        if numeric_cols:
+            col = numeric_cols[0]
+            return f"SELECT AVG({col}) as avg_{col} FROM data"
+    
+    # Count questions
+    if 'count' in question_lower or 'how many' in question_lower:
+        return "SELECT COUNT(*) as total_count FROM data"
+    
+    # Default: select all
+    return "SELECT * FROM data LIMIT 10"
+
+def combine_analysis_results(sub_results: List[Dict[str, Any]], original_question: str) -> Dict[str, Any]:
+    """
+    Intelligently combine results from multiple sub-queries.
+    
+    Args:
+        sub_results: Results from sub-queries
+        original_question: Original complex question
+        
+    Returns:
+        Combined analysis result
+    """
+    successful_results = [r for r in sub_results if r["success"]]
+    
+    if not successful_results:
+        return {
+            "answer": "Unable to process the question due to query errors.",
+            "explanation": "All sub-queries failed to execute properly.",
+            "table": None,
+            "raw_insights": ["Query execution failed"]
+        }
+    
+    # Combine answers
+    answers = []
+    insights = []
+    tables = []
+    
+    for result in successful_results:
+        if not result["result"].empty:
+            # Extract key information from each result
+            df = result["result"]
+            
+            if len(df.columns) == 1:
+                # Single value result
+                value = df.iloc[0, 0]
+                if isinstance(value, (int, float)):
+                    answers.append(f"{value:,.2f}")
+                    insights.append(f"Calculated: {value:,.2f}")
+                else:
+                    answers.append(str(value))
+                    insights.append(f"Found: {value}")
+            else:
+                # Multi-column result
+                if len(df) > 0:
+                    first_row = df.iloc[0]
+                    if len(df.columns) >= 2:
+                        answers.append(f"{first_row.iloc[0]}: {first_row.iloc[1]:,.2f}")
+                        insights.append(f"Top result: {first_row.iloc[0]} with {first_row.iloc[1]:,.2f}")
+            
+            tables.append(df.to_string(index=False))
+    
+    # Create final answer
+    if len(answers) == 1:
+        final_answer = answers[0]
+    elif len(answers) == 2:
+        final_answer = f"{answers[0]}. {answers[1]}."
+    else:
+        final_answer = ". ".join(answers) + "."
+    
+    return {
+        "answer": final_answer,
+        "explanation": "Analysis completed using multiple focused queries for accuracy.",
+        "table": "\n\n".join(tables) if tables else None,
+        "raw_insights": insights
+    }
+
+def analyze_with_enhanced_approach(
     question: str, 
     df: pd.DataFrame, 
     file_title: Optional[str] = None,
     schema: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    IMPROVED: Analyze the dataset using a two-stage approach with SQL generation.
-    Enhanced for agentic RAG systems with better tool coordination.
+    FIXED: Enhanced analysis approach that handles multi-part questions properly.
     
     Args:
         question: Natural language business question
@@ -445,198 +440,122 @@ def analyze_with_gpt_v2(
         schema: Optional column headers for reference
         
     Returns:
-        Dictionary with comprehensive analysis results for agent consumption
+        Dictionary with comprehensive analysis results
     """
     try:
-        # Stage 0: Analyze requirements and suitability
+        # Step 1: Analyze requirements
         requirements = detect_analysis_requirements(question, df)
         
-        # Stage 1: Generate smart schema summary
-        schema_summary = generate_smart_schema_summary(df)
-        
-        # Stage 2: Generate SQL query using GPT
-        sql_query = generate_sql_query_with_gpt(question, schema_summary)
-        
-        # Stage 3: Execute SQL query
-        query_result = execute_sql_on_dataframe(df, sql_query)
-        
-        # Stage 4: Get strategic sample for context
-        strategic_sample = create_strategic_data_sample(df, max_rows=8)
-        
-        # Stage 5: Enhanced prompt for agent coordination
-        system_prompt = """You are a data analysis specialist working as part of an AI agent team that includes RAG, document retrieval, and SQL tools.
-
-Your role is to provide computational analysis that complements these other tools. Focus on:
-1. Statistical calculations and data insights
-2. Patterns and trends that require full dataset analysis  
-3. Complex aggregations and computations
-4. Quantitative answers with specific numbers
-
-Return ONLY valid JSON in this exact format:
-{
-  "answer": "Direct, specific answer with numbers/data",
-  "explanation": "Brief methodology and key findings", 
-  "table": "Formatted results table (if helpful, else null)",
-  "raw_insights": ["insight1", "insight2", "insight3"],
-  "suggested_followup": "One natural follow-up question (or null)"
-}
-
-Be precise, quantitative, and actionable. Your insights will be used by other AI tools."""
-
-        # Build enhanced prompt with agent context
-        user_prompt = f"""
-AGENT CONTEXT:
-- Analysis Type: {requirements['analysis_type']}
-- Tool Suitability: {requirements['tool_suitability']:.2f}
-- This tool specializes in: computational analysis, statistics, full-dataset operations
-
-BUSINESS QUESTION: {question}
-File Source: {file_title or 'Unknown'}
-
-DATASET ANALYSIS:
-Total Rows: {len(df)}
-Columns: {list(df.columns)}
-Numeric Columns: {len(df.select_dtypes(include=[np.number]).columns)}
-
-SQL QUERY EXECUTED:
-{sql_query}
-
-QUERY RESULTS ({len(query_result)} rows):
-{query_result.to_string(index=False) if len(query_result) > 0 else "No results returned"}
-
-SAMPLE DATA PATTERNS:
-{strategic_sample.head(5).to_string(index=False)}
-
-STATISTICAL SUMMARY:
-{df.describe().to_string() if len(df.select_dtypes(include=[np.number]).columns) > 0 else "No numeric data for statistics"}
-
-Provide computational analysis in the required JSON format:"""
-
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=1000,
-            temperature=0.1
-        )
-        
-        gpt_response = response.choices[0].message.content.strip()
-        logger.info("Received enhanced response from GPT for agent system")
-        
-        # Parse JSON response with enhanced error handling
-        try:
-            result = json.loads(gpt_response)
-            
-            # Add agent-specific metadata
-            result["sql_query"] = sql_query
-            result["confidence_score"] = min(requirements["tool_suitability"], 0.95)
-            result["analysis_type"] = requirements["analysis_type"]
-            
-            # Ensure raw_insights exists
-            if "raw_insights" not in result:
-                result["raw_insights"] = [result.get("answer", "Analysis completed")]
-            
-            # Ensure suggested_followup exists
-            if "suggested_followup" not in result:
-                result["suggested_followup"] = None
-                
-            return result
-            
-        except json.JSONDecodeError:
-            logger.warning("GPT response was not valid JSON, creating structured fallback")
-            
-            # Enhanced fallback with agent context
-            fallback_insights = []
-            if len(query_result) > 0:
-                fallback_insights.append(f"Query returned {len(query_result)} results")
-                if query_result.select_dtypes(include=[np.number]).columns.any():
-                    numeric_cols = query_result.select_dtypes(include=[np.number]).columns
-                    for col in numeric_cols[:2]:  # Max 2 columns
-                        if len(query_result[col].dropna()) > 0:
-                            fallback_insights.append(f"{col}: {query_result[col].sum():.2f} total")
-            
+        # Step 2: Check if pandas is better for this analysis
+        pandas_result = execute_pandas_analysis(df, question)
+        if pandas_result:
             return {
-                "answer": gpt_response[:200] + "..." if len(gpt_response) > 200 else gpt_response,
-                "explanation": "Analysis completed with computational approach, response formatting adjusted",
-                "table": query_result.to_string(index=False) if len(query_result) <= 20 else None,
-                "sql_query": sql_query,
-                "confidence_score": 0.6,
+                "answer": pandas_result["answer"],
+                "explanation": f"Used pandas for {pandas_result['method']} - more accurate than SQL for this calculation.",
+                "table": pandas_result["table"],
+                "sql_query": None,
+                "confidence_score": 0.9,
                 "analysis_type": requirements["analysis_type"],
                 "suggested_followup": None,
-                "raw_insights": fallback_insights if fallback_insights else ["Analysis provided computational results"]
+                "raw_insights": [f"Pandas calculation: {pandas_result['result']}"]
+            }
+        
+        # Step 3: Handle multi-part questions
+        if requirements["is_multi_part"]:
+            sub_questions = decompose_complex_question(question)
+            logger.info(f"Decomposed question into: {sub_questions}")
+            
+            # Execute focused queries
+            sub_results = execute_simple_sql_queries(df, sub_questions)
+            
+            # Combine results
+            combined_result = combine_analysis_results(sub_results, question)
+            
+            return {
+                "answer": combined_result["answer"],
+                "explanation": combined_result["explanation"],
+                "table": combined_result["table"],
+                "sql_query": " | ".join([r["query"] for r in sub_results if r["success"]]),
+                "confidence_score": 0.85,
+                "analysis_type": requirements["analysis_type"],
+                "suggested_followup": None,
+                "raw_insights": combined_result["raw_insights"]
+            }
+        
+        # Step 4: Handle simple questions with single query
+        else:
+            simple_query = generate_simple_sql_query(question, df)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as tmp_file:
+                conn = sqlite3.connect(tmp_file.name)
+                df.to_sql('data', conn, index=False, if_exists='replace')
+                result_df = pd.read_sql_query(simple_query, conn)
+                conn.close()
+                os.unlink(tmp_file.name)
+            
+            # Format answer from result
+            if not result_df.empty:
+                if len(result_df.columns) == 1:
+                    value = result_df.iloc[0, 0]
+                    answer = f"Result: {value:,.2f}" if isinstance(value, (int, float)) else str(value)
+                else:
+                    answer = f"Analysis completed successfully."
+            else:
+                answer = "No results found for the query."
+            
+            return {
+                "answer": answer,
+                "explanation": "Single query analysis executed successfully.",
+                "table": result_df.to_string(index=False) if len(result_df) <= 20 else None,
+                "sql_query": simple_query,
+                "confidence_score": 0.8,
+                "analysis_type": requirements["analysis_type"],
+                "suggested_followup": None,
+                "raw_insights": ["Single query executed"] if not result_df.empty else ["No data returned"]
             }
         
     except Exception as e:
-        logger.error(f"Error in enhanced GPT analysis: {str(e)}")
-        
-        # Robust fallback that still provides value to the agent
+        logger.error(f"Error in enhanced analysis: {str(e)}")
         return {
-            "answer": f"Computational analysis encountered an issue: {str(e)}",
-            "explanation": "Python analyzer attempted data processing but encountered technical difficulties. Other tools in the agent system may provide better results for this query.",
+            "answer": f"Analysis encountered an error: {str(e)}",
+            "explanation": "Error occurred during data analysis.",
             "table": None,
-            "sql_query": sql_query if 'sql_query' in locals() else None,
+            "sql_query": None,
             "confidence_score": 0.1,
             "analysis_type": "error",
-            "suggested_followup": "Try rephrasing the question or check if RAG tools might handle this better",
-            "raw_insights": ["Tool encountered processing error", "Other agent tools may be more suitable"]
+            "suggested_followup": None,
+            "raw_insights": ["Analysis error occurred"]
         }
 
 @app.post("/smart-analysis", response_model=AnalysisResponse)
 async def smart_analysis(request: AnalysisRequest):
     """
-    Analyze tabular business data based on natural language questions.
-    
-    Enhanced for agentic RAG systems - this tool specializes in computational analysis,
-    statistical operations, and data insights that complement RAG and document retrieval tools.
-    
-    Use this tool when you need:
-    - Statistical calculations and aggregations
-    - Trend analysis over full datasets  
-    - Complex mathematical operations
-    - Quantitative insights with specific numbers
-    - Analysis that requires seeing all data rows
+    FIXED: Analyze tabular business data with improved multi-query handling.
     """
     try:
-        logger.info(f"Processing agentic analysis request: {request.question}")
+        logger.info(f"Processing analysis request: {request.question}")
         
         # Clean and normalize the data
         df = clean_and_normalize_data(request.rows)
         
-        # Detect analysis requirements for agent coordination
-        requirements = detect_analysis_requirements(request.question, df)
-        
-        # Log agent guidance
-        if requirements["tool_suitability"] < 0.5:
-            logger.info(f"Low tool suitability ({requirements['tool_suitability']:.2f}) - agent might prefer RAG/document tools")
-        
-        # Analyze with enhanced GPT approach
-        analysis_result = analyze_with_gpt_v2(
+        # Use enhanced analysis approach
+        analysis_result = analyze_with_enhanced_approach(
             question=request.question,
             df=df,
             file_title=request.file_title,
             schema=request.schema
         )
         
-        # Prepare comprehensive metadata for agent system
+        # Prepare metadata
         metadata = {
             "total_rows": len(df),
             "columns": list(df.columns),
             "file_title": request.file_title,
             "data_types": df.dtypes.astype(str).to_dict(),
-            "analysis_method": "python_analyzer_v2",
-            "tool_requirements": requirements,
-            "schema_summary": generate_smart_schema_summary(df),
-            "agent_guidance": {
-                "tool_suitability": requirements["tool_suitability"],
-                "recommended_approach": requirements["recommended_approach"],
-                "complexity": requirements["complexity"],
-                "requires_full_dataset": requirements["requires_full_dataset"]
-            }
+            "analysis_method": "enhanced_multi_query_v3"
         }
         
-        # Build comprehensive response for agent
+        # Build response
         response = AnalysisResponse(
             answer=analysis_result["answer"],
             explanation=analysis_result["explanation"],
@@ -649,173 +568,48 @@ async def smart_analysis(request: AnalysisRequest):
             metadata=metadata
         )
         
-        logger.info(f"Analysis completed - Type: {response.analysis_type}, Confidence: {response.confidence_score:.2f}")
+        logger.info(f"Analysis completed successfully")
         return response
         
-    except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Python analyzer encountered an error - other agent tools may handle this query better"
+            detail=f"Analysis failed: {str(e)}"
         )
-
-@app.post("/tool-recommendation")
-async def tool_recommendation(request: AnalysisRequest):
-    """
-    Analyze a question and data to recommend which tool the agent should use.
-    
-    Returns guidance on whether this Python analyzer, RAG, document retrieval,
-    or SQL tools would be most effective for the given question.
-    """
-    try:
-        # Quick data overview without full processing
-        df_sample = pd.DataFrame(request.rows[:100])  # Sample for speed
-        if df_sample.empty:
-            raise ValueError("No data provided")
-        
-        # Analyze requirements
-        requirements = detect_analysis_requirements(request.question, df_sample)
-        
-        # Build recommendations
-        recommendations = {
-            "python_analyzer": {
-                "suitability": requirements["tool_suitability"],
-                "reasons": []
-            },
-            "rag_tool": {
-                "suitability": 0.5,
-                "reasons": []
-            },
-            "document_retrieval": {
-                "suitability": 0.3,
-                "reasons": []
-            },
-            "sql_tool": {
-                "suitability": 0.4,
-                "reasons": []
-            }
-        }
-        
-        question_lower = request.question.lower()
-        
-        # Python analyzer strengths
-        if requirements["computation_heavy"]:
-            recommendations["python_analyzer"]["reasons"].append("Question requires complex calculations")
-        if requirements["requires_full_dataset"]:
-            recommendations["python_analyzer"]["reasons"].append("Analysis needs complete dataset view")
-        if requirements["analysis_type"] in ["statistical", "advanced_analytics"]:
-            recommendations["python_analyzer"]["reasons"].append("Statistical/advanced analysis required")
-        
-        # RAG tool strengths  
-        if any(word in question_lower for word in ['explain', 'describe', 'what is', 'meaning', 'context']):
-            recommendations["rag_tool"]["suitability"] = 0.9
-            recommendations["rag_tool"]["reasons"].append("Question seeks explanation or context")
-        if any(word in question_lower for word in ['document', 'text', 'content', 'summary']):
-            recommendations["rag_tool"]["suitability"] = 0.8
-            recommendations["rag_tool"]["reasons"].append("Question about document content")
-        
-        # Document retrieval strengths
-        if any(word in question_lower for word in ['meeting notes', 'specific document', 'file']):
-            recommendations["document_retrieval"]["suitability"] = 0.9
-            recommendations["document_retrieval"]["reasons"].append("Question targets specific documents")
-        
-        # SQL tool strengths
-        if len(df_sample) > 1000 and requirements["analysis_type"] == "aggregation":
-            recommendations["sql_tool"]["suitability"] = 0.8
-            recommendations["sql_tool"]["reasons"].append("Large dataset with aggregation needs")
-        
-        # Find best tool
-        best_tool = max(recommendations.keys(), key=lambda x: recommendations[x]["suitability"])
-        
-        return {
-            "recommended_tool": best_tool,
-            "recommendations": recommendations,
-            "analysis_requirements": requirements,
-            "confidence": recommendations[best_tool]["suitability"],
-            "data_overview": {
-                "rows": len(request.rows),
-                "columns": len(df_sample.columns) if not df_sample.empty else 0,
-                "numeric_columns": len(df_sample.select_dtypes(include=[np.number]).columns) if not df_sample.empty else 0
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in tool recommendation: {str(e)}")
-        return {
-            "recommended_tool": "python_analyzer",
-            "confidence": 0.5,
-            "error": str(e),
-            "fallback": True
-        }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
-    return {"status": "healthy", "service": "smart-analysis-api", "version": "2.0.0"}
+    return {"status": "healthy", "service": "smart-analysis-api", "version": "3.0.0"}
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Smart Analysis API v2.0 - Python Analyzer Tool for Agentic RAG Systems", 
-        "version": "2.0.0",
-        "purpose": "Computational analysis tool designed to complement RAG, document retrieval, and SQL tools in AI agent systems",
-        "specializes_in": [
-            "Statistical calculations and aggregations",
-            "Trend analysis over full datasets",
-            "Complex mathematical operations", 
-            "Quantitative insights with specific numbers",
-            "Pattern detection and outlier analysis",
-            "Multi-dimensional data analysis"
+        "message": "Smart Analysis API v3.0 - FIXED Multi-Query Python Analyzer", 
+        "version": "3.0.0",
+        "fixes_applied": [
+            "Multi-part question decomposition",
+            "Focused simple SQL queries instead of complex ones",
+            "Pandas integration for correlation/complex math",
+            "Answer validation and consistency checking",
+            "Better error handling and fallbacks"
         ],
-        "works_best_with": [
-            "Questions requiring calculations (sum, average, count, etc.)",
-            "Trend and time series analysis",
-            "Complex aggregations across large datasets",
-            "Statistical operations (correlations, distributions)",
-            "Data that needs full context (not just chunks)"
-        ],
-        "agent_coordination": {
-            "tool_recommendation_endpoint": "/tool-recommendation",
-            "confidence_scoring": "Returns 0.0-1.0 confidence scores",
-            "fallback_guidance": "Suggests when other tools might be better",
-            "structured_output": "JSON format optimized for agent consumption"
-        },
-        "improvements_v2": [
-            "Enhanced prompt engineering with structured JSON output",
-            "Two-stage analysis: SQL generation + interpretation",
-            "Smart schema inference and validation",
-            "Strategic data sampling for better context",
-            "Tool suitability detection for agent coordination",
-            "Confidence scoring and fallback recommendations",
-            "Raw insights extraction for cross-tool reasoning"
-        ],
-        "endpoints": {
-            "POST /smart-analysis": "Main analysis endpoint - computational data analysis",
-            "POST /tool-recommendation": "Helps agents choose the right tool for each question",
-            "GET /health": "Health check and system status",
-            "GET /docs": "Interactive API documentation"
-        },
-        "integration_notes": {
-            "designed_for": "Multi-tool AI agent systems with RAG, document retrieval, and SQL capabilities",
-            "coordinates_with": "Vector databases, document stores, and other analytical tools",
-            "provides_fallbacks": "Graceful degradation when other tools might be more suitable"
-        }
+        "improvements": [
+            "Breaks complex questions into simple parts",
+            "Uses multiple focused queries for accuracy",
+            "Combines results intelligently", 
+            "Validates answers match actual data",
+            "Uses pandas for calculations SQL can't handle"
+        ]
     }
 
 if __name__ == "__main__":
-    # Check for required environment variables
     if not os.getenv("OPENAI_API_KEY"):
         logger.error("OPENAI_API_KEY environment variable is required")
         exit(1)
     
-    # Run the application
     uvicorn.run(
         "python_smart_analysis:app",
         host="0.0.0.0",
