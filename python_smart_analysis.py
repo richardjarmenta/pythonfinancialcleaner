@@ -1,24 +1,89 @@
-import pandas as pd
-import numpy as np
-import sqlite3
-import tempfile
+"""
+Smart Analysis API - FastAPI service for analyzing business data with AI-Enhanced Analysis
+IMPROVED VERSION - Uses OpenAI for intelligent SQL generation and answer formatting
+"""
+
 import os
 import re
-import logging
 import json
-from typing import Dict, List, Any, Optional, Union
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
+import openai
 from openai import OpenAI
+import uvicorn
+import logging
+from datetime import datetime, timedelta
+import sqlite3
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize FastAPI app
+app = FastAPI(
+    title="Smart Analysis API",
+    description="Analyze tabular business data using natural language questions with AI-Enhanced Analysis",
+    version="3.0.0"
+)
+
+# Add CORS middleware for web integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Pydantic models for request and response validation
+class AnalysisRequest(BaseModel):
+    """Request model for the smart analysis endpoint"""
+    question: str = Field(..., description="Natural language business question")
+    rows: List[Dict[str, Any]] = Field(..., description="List of data rows from Supabase")
+    file_title: Optional[str] = Field(None, description="Optional metadata about the data source")
+    schema: Optional[List[str]] = Field(None, description="Optional column headers for reference")
+    
+    @field_validator('question')
+    @classmethod
+    def question_must_not_be_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Question cannot be empty')
+        return v.strip()
+    
+    @field_validator('rows')
+    @classmethod
+    def rows_must_not_be_empty(cls, v):
+        if not v:
+            raise ValueError('Rows cannot be empty')
+        return v
+
+class AnalysisResponse(BaseModel):
+    """Response model for the smart analysis endpoint"""
+    answer: str = Field(..., description="Direct answer to the business question")
+    explanation: str = Field(..., description="Explanation of the analysis approach")
+    table: Optional[str] = Field(None, description="Formatted table data if relevant")
+    sql_query: Optional[str] = Field(None, description="SQL query used for analysis")
+    confidence_score: float = Field(..., description="Confidence score between 0-1")
+    analysis_type: str = Field(..., description="Type of analysis performed")
+    suggested_followup: Optional[str] = Field(None, description="Suggested follow-up questions")
+    raw_insights: List[str] = Field(default_factory=list, description="Raw insights from analysis")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+# ================================
+# AI-ENHANCED ANALYSIS FUNCTIONS
+# ================================
+
 def clean_and_normalize_data(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """
-    KEEP AS-IS: This function works perfectly for cleaning and normalizing data.
+    Clean and normalize the input data for analysis
     """
     if not rows:
         return pd.DataFrame()
@@ -48,7 +113,7 @@ def clean_and_normalize_data(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 def execute_pandas_correlation(df: pd.DataFrame, question: str) -> Optional[Dict[str, Any]]:
     """
-    KEEP AS-IS: Correlation analysis working perfectly.
+    Handle correlation analysis with proper type safety
     """
     try:
         question_lower = question.lower()
@@ -95,7 +160,7 @@ def execute_pandas_correlation(df: pd.DataFrame, question: str) -> Optional[Dict
 
 def ai_analyze_question_intent(question: str, schema: List[str]) -> Dict[str, Any]:
     """
-    NEW: Use OpenAI to understand what the question is really asking
+    Use OpenAI to understand what the question is really asking
     """
     try:
         prompt = f"""Analyze this business question and determine the analysis approach:
@@ -135,7 +200,7 @@ Return only valid JSON in this exact format:
 
 def ai_generate_sql_query(question: str, df: pd.DataFrame, schema: List[str]) -> str:
     """
-    NEW: Use OpenAI to generate contextually appropriate SQL queries
+    Use OpenAI to generate contextually appropriate SQL queries
     """
     try:
         sample_data = df.head(2).to_dict('records') if len(df) > 0 else []
@@ -181,9 +246,9 @@ SQL Query:"""
         # Fallback to basic SQL
         return "SELECT * FROM data LIMIT 10"
 
-def ai_format_answer(question: str, sql_results: List[Dict], business_intent: str) -> str:
+def ai_format_answer(question: str, sql_results: List[pd.DataFrame], business_intent: str) -> str:
     """
-    NEW: Use OpenAI to format results appropriately for business context
+    Use OpenAI to format results appropriately for business context
     """
     try:
         # Convert DataFrame results to simple dictionaries
@@ -252,20 +317,6 @@ def execute_sql_query(sql: str, df: pd.DataFrame) -> pd.DataFrame:
         logger.error(f"Error executing SQL query: {sql} - {str(e)}")
         return pd.DataFrame()
 
-def detect_analysis_requirements(question: str, df: pd.DataFrame) -> Dict[str, bool]:
-    """
-    ENHANCED: Detect what type of analysis is needed
-    """
-    question_lower = question.lower()
-    
-    return {
-        "needs_pandas": 'correlation' in question_lower and 'between' in question_lower,
-        "is_multi_part": len([q for q in question.split('?') if q.strip()]) > 1 or 
-                        (' and ' in question_lower and any(word in question_lower for word in ['how many', 'what', 'which'])),
-        "needs_grouping": any(word in question_lower for word in ['which', 'best', 'highest', 'top', 'by region', 'by category']),
-        "needs_filtering": any(word in question_lower for word in ['above', 'below', 'more than', 'less than', 'active', 'enrolled'])
-    }
-
 def decompose_complex_question(question: str) -> List[str]:
     """
     Break down complex questions into simpler parts
@@ -298,7 +349,7 @@ def analyze_with_ai_enhanced_approach(
     schema: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    MAIN FUNCTION: AI-Enhanced analysis approach
+    Main AI-Enhanced analysis function
     """
     try:
         # Step 1: Analyze question intent with AI
@@ -401,10 +452,10 @@ def analyze_data_file(
     schema: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    MAIN ENTRY POINT: Analyze data and answer questions using AI-enhanced approach
+    Main entry point for data analysis
     """
     try:
-        # Clean and normalize the data (keep existing perfect logic)
+        # Clean and normalize the data
         df = clean_and_normalize_data(rows)
         
         if df.empty:
@@ -447,22 +498,70 @@ def analyze_data_file(
             "metadata": {"error": str(e)}
         }
 
-# Example usage:
+# ================================
+# API ENDPOINTS
+# ================================
+
+@app.post("/smart-analysis", response_model=AnalysisResponse)
+async def analyze_data(request: AnalysisRequest) -> AnalysisResponse:
+    """
+    Main endpoint for analyzing business data with natural language questions
+    """
+    try:
+        logger.info(f"Received analysis request: {request.question}")
+        logger.info(f"Data rows: {len(request.rows)}")
+        
+        # Perform the analysis using AI-enhanced approach
+        result = analyze_data_file(
+            rows=request.rows,
+            question=request.question,
+            file_title=request.file_title,
+            schema=request.schema
+        )
+        
+        # Convert to Pydantic response model
+        response = AnalysisResponse(**result)
+        
+        logger.info(f"Analysis completed: {response.analysis_type}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error in analyze endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Analysis failed: {str(e)}"
+        )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "version": "3.0.0",
+        "analysis_engine": "ai_enhanced",
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY"))
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Smart Analysis API - AI Enhanced Version",
+        "version": "3.0.0",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
 if __name__ == "__main__":
-    # Make sure you have OPENAI_API_KEY set in your environment variables
-    # export OPENAI_API_KEY="your-openai-api-key-here"
+    # Check for required environment variables
+    if not os.getenv("OPENAI_API_KEY"):
+        logger.error("OPENAI_API_KEY environment variable is required")
+        exit(1)
     
-    # Test with sample data
-    sample_data = [
-        {"patient_id": "PT001", "clinic_name": "Downtown Medical", "wait_time": 25, "patient_satisfaction": 7.2},
-        {"patient_id": "PT002", "clinic_name": "Westside Health", "wait_time": 45, "patient_satisfaction": 5.8},
-        {"patient_id": "PT003", "clinic_name": "Central Clinic", "wait_time": 15, "patient_satisfaction": 8.9}
-    ]
-    
-    result = analyze_data_file(
-        rows=sample_data,
-        question="What is the correlation between wait time and patient satisfaction?",
-        file_title="Healthcare Analytics"
+    # Run the application
+    uvicorn.run(
+        "python_smart_analysis:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        reload=False
     )
-    
-    print(json.dumps(result, indent=2))
